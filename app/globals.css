@@ -1,0 +1,126 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html, body {
+  background: #000000;
+  color: #E8E8E8;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* Scrollbar 风格化 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0A0A0A; }
+::-webkit-scrollbar-thumb { background: #2A2A2A; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #3A3A3A; }
+
+/* 玻璃态卡片 */
+.glass {
+  background: rgba(26, 26, 26, 0.6);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(232, 232, 232, 0.08);
+}
+
+.glass-bright {
+  background: rgba(34, 34, 34, 0.8);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(232, 232, 232, 0.15);
+}
+
+/* 渐变文字 */
+.text-gradient-silver {
+  background: linear-gradient(135deg, #FFFFFF 0%, #C0C0C0 50%, #8A8A8A 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.text-gradient-glow {
+  background: linear-gradient(135deg, #FFFFFF 0%, #E8E8E8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  filter: drop-shadow(0 0 12px rgba(232, 232, 232, 0.3));
+}
+
+/* 动画 */
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.shimmer {
+  background: linear-gradient(90deg, transparent 0%, rgba(232, 232, 232, 0.15) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: shimmer 2s ease-in-out infinite;
+}
+
+@keyframes pulse-glow {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+/* SVG 棋盘 - 格子高亮 */
+.square-last {
+  box-shadow: inset 0 0 0 3px rgba(232, 232, 232, 0.8);
+}
+.square-selected {
+  box-shadow: inset 0 0 0 3px rgba(232, 232, 232, 1);
+}
+.square-hint {
+  background: rgba(232, 232, 232, 0.15);
+}
+.square-threat {
+  background: rgba(239, 68, 68, 0.3);
+}
+.square-best {
+  box-shadow: inset 0 0 0 3px rgba(34, 197, 94, 0.9);
+}
+
+/* Board piece 渲染 */
+.piece {
+  user-select: none;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: transform 0.15s ease;
+}
+.piece:hover {
+  transform: scale(1.05);
+}
+
+/* Win rate bar */
+.winrate-bar {
+  background: linear-gradient(to top, #22C55E 0%, #22C55E 50%, #C0C0C0 50%, #C0C0C0 100%);
+}
+
+/* Thinking dots */
+@keyframes thinking {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+.thinking-dot {
+  animation: thinking 1.4s ease-in-out infinite;
+}
+.thinking-dot:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dot:nth-child(3) { animation-delay: 0.4s; }

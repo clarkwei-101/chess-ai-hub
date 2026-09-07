@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "chess-ai-hub": {
+      "command": "/opt/homebrew/bin/python3",
+      "args": ["${workspaceFolder}/visual/mcp_server.py"],
+      "description": "Chess AI Hub — analyze FEN, lookup openings, parse Lichess URLs",
+      "autoApprove": ["analyze_fen", "get_opening", "parse_lichess_url", "chess_visual_status", "lichess_game_info"]
+    }
+  }
+}

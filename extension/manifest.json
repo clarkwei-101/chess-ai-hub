@@ -1,0 +1,45 @@
+{
+  "manifest_version": 3,
+  "name": "Chess AI Hub Assistant",
+  "version": "1.0.0",
+  "description": "Real-time AI chess analysis for Lichess and Chess.com",
+  "permissions": [
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://lichess.org/*",
+    "https://www.chess.com/*",
+    "http://localhost:3002/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://lichess.org/*"],
+      "js": ["lichess-injector.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_end"
+    },
+    {
+      "matches": ["https://www.chess.com/*"],
+      "js": ["chesscom-injector.js"],
+      "css": ["overlay.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
