@@ -151,14 +151,19 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [variant, styleId]);
 
-  // 启动分析 SSE stream
+  // 启动分析 SSE stream — 默认 depth=18 (平衡速度与质量), 无限搜索继续深化
   const startAnalysisStream = useCallback(() => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
     }
-    const url = `/api/engine/analyze?variant=${variant}&depth=22&multipv=3`;
+    const url = `/api/engine/analyze?variant=${variant}&depth=18&multipv=3`;
     const es = new EventSource(url);
     eventSourceRef.current = es;
+    es.onopen = () => {
+      // 连接建立后立即把 UI 从 'starting' 切到 'thinking', 给用户即时反馈
+      setEngineStatus('thinking');
+      setError(null);
+    };
     es.onmessage = (e) => {
       try {
         const data = JSON.parse(e.data);

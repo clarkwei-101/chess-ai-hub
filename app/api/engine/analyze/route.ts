@@ -49,11 +49,18 @@ export async function GET(req: NextRequest) {
         const it = engineManager.analyze(variant, { depth, multipv });
         const firstTs = Date.now();
         let gotFirst = false;
-        while (Date.now() - firstTs < 60000 && !gotFirst && !streamClosed) {
+        // Hard timeout for first chunk: 30s is plenty (Stockfish 1s, Pikafish 2s, KataGo 3s warm)
+        const FIRST_TIMEOUT_MS = 30_000;
+        while (Date.now() - firstTs < FIRST_TIMEOUT_MS && !gotFirst && !streamClosed) {
           const next = await Promise.race([
             it.next(),
-            new Promise<{ value: undefined; done: true }>((r) => setTimeout(() => r({ value: undefined, done: true }), 60000)),
+            new Promise<{ value: undefined; done: true }>((r) => setTimeout(() => r({ value: undefined, done: true }), FIRST_TIMEOUT_MS)),
           ]);
+          if (streamClosed) {
+            // 客户端断了 — 主动让 generator return(),触发它的 finally 清理
+            try { await it.return(undefined as any); } catch {}
+            break;
+          }
           if (next.done || !next.value) break;
           send(next.value);
           gotFirst = true;
@@ -65,6 +72,10 @@ export async function GET(req: NextRequest) {
               it.next(),
               new Promise<{ value: undefined; done: true }>((r) => setTimeout(() => r({ value: undefined, done: true }), 30000)),
             ]);
+            if (streamClosed) {
+              try { await it.return(undefined as any); } catch {}
+              break;
+            }
             if (next.done || !next.value) break;
             send(next.value);
           }

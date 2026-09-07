@@ -15,8 +15,34 @@ const ENGINE_DIR = path.resolve(process.cwd(), 'engines');
 const STOCKFISH_BIN = path.join(ENGINE_DIR, 'stockfish');
 const PIKAFISH_BIN = path.join(ENGINE_DIR, 'pikafish');
 const KATAGO_BIN = path.join(ENGINE_DIR, 'katago');
-const KATAGO_MODEL = path.join(ENGINE_DIR, 'networks', 'kata1-tf2-b10c384-s2941M-d5872M.bin.gz');
 const KATAGO_CONFIG = path.join(ENGINE_DIR, 'gtp.cfg');
+
+/** Auto-detect the KataGo network file in engines/networks/ — order matters:
+ *  tf2 (smaller, faster on Metal) → b18c384 (stronger) → b10c192 (fallback).
+ *  We probe both .bin.gz and .bin variants since the bootstrap script gunzips on download.
+ */
+function detectKataGoModel(): string | null {
+  const candidates = [
+    'kata1-tf2-b10c384-s2941M-d5872M.bin.gz',
+    'kata1-tf2-b10c384-s2941M-d5872M.bin',
+    'kata1-b18c384nbt-autov2.bin.gz',
+    'kata1-b18c384nbt-autov2.bin',
+    'kata1-b10c192nbt-adamxantidiag.bin.gz',
+    'kata1-b10c192nbt-adamxantidiag.bin',
+  ];
+  for (const name of candidates) {
+    const p = path.join(ENGINE_DIR, 'networks', name);
+    if (fs.existsSync(p)) return p;
+  }
+  // last-ditch: any *.bin.gz in networks/
+  try {
+    const files = fs.readdirSync(path.join(ENGINE_DIR, 'networks'));
+    const found = files.find((f) => f.endsWith('.bin.gz') || f.endsWith('.bin'));
+    if (found) return path.join(ENGINE_DIR, 'networks', found);
+  } catch {}
+  return null;
+}
+const KATAGO_MODEL = detectKataGoModel();
 
 export interface EngineSession {
   variant: GameVariant;
@@ -47,6 +73,10 @@ export interface EngineSession {
   lastOwnership: number[][] | null;
   // 当前风格 (棋手 profile) — 影响引擎 hint + thinking time
   currentStyleId: string;
+  // AbortController for the currently running analyze() generator.
+  // When a new analyze() starts before the previous one ends (race), we call
+  // analyzeAbort?.abort() to wake its while-loop and let it return cleanly.
+  analyzeAbort?: AbortController;
   // 已注册的 proc 监听器 (供 stop() 清理,避免 restart 时累积)
   procListeners: {
     stderr: (buf: Buffer) => void;
@@ -105,12 +135,51 @@ export class EngineManager {
 
   private sessions: Map<string, EngineSession> = new Map();
 
-  /** 检查引擎二进制存在 */
+  /** 检查引擎二进制 + 网络文件存在 */
   static health(): Record<GameVariant, boolean> {
     return {
       chess: fs.existsSync(STOCKFISH_BIN),
       xiangqi: fs.existsSync(PIKAFISH_BIN),
-      go: fs.existsSync(KATAGO_BIN) && fs.existsSync(KATAGO_MODEL),
+      go: fs.existsSync(KATAGO_BIN) && fs.existsSync(KATAGO_MODEL ?? ''),
+    };
+  }
+
+  /** Diagnostics — for the /api/engine/diagnostics route, so users can self-debug */
+  static diagnostics(): {
+    engines: Record<GameVariant, { binary: string; binaryExists: boolean; binaryExec: boolean; extra?: Record<string, unknown> }>;
+    modelPath: string | null;
+    gtpConfig: string;
+    cwd: string;
+    hint: string | null;
+  } {
+    const canExec = (p: string) => {
+      try { fs.accessSync(p, fs.constants.X_OK); return true; } catch { return false; }
+    };
+    const engines = {
+      chess: { binary: STOCKFISH_BIN, binaryExists: fs.existsSync(STOCKFISH_BIN), binaryExec: canExec(STOCKFISH_BIN) },
+      xiangqi: {
+        binary: PIKAFISH_BIN,
+        binaryExists: fs.existsSync(PIKAFISH_BIN),
+        binaryExec: canExec(PIKAFISH_BIN),
+        extra: { nnue: path.join(process.cwd(), 'pikafish.nnue'), nnueExists: fs.existsSync(path.join(process.cwd(), 'pikafish.nnue')) },
+      },
+      go: {
+        binary: KATAGO_BIN,
+        binaryExists: fs.existsSync(KATAGO_BIN),
+        binaryExec: canExec(KATAGO_BIN),
+        extra: { model: KATAGO_MODEL ?? null, config: KATAGO_CONFIG, configExists: fs.existsSync(KATAGO_CONFIG) },
+      },
+    };
+    const allReady = engines.chess.binaryExec && engines.xiangqi.binaryExec && engines.go.binaryExec && engines.go.extra?.configExists;
+    const hint = allReady
+      ? null
+      : 'Some engines are missing. Run `npm run engines:download` (or `bash scripts/download-engines.sh`) to install. See /api/engine/diagnostics for details.';
+    return {
+      engines,
+      modelPath: KATAGO_MODEL ?? null,
+      gtpConfig: KATAGO_CONFIG,
+      cwd: process.cwd(),
+      hint,
     };
   }
 
@@ -166,12 +235,19 @@ export class EngineManager {
     } else if (variant === 'xiangqi') {
       bin = PIKAFISH_BIN;
     } else {
+      if (!KATAGO_MODEL) {
+        throw new Error('KataGo neural network not found in engines/networks/. Run: npm run engines:download');
+      }
       bin = KATAGO_BIN;
       args = ['gtp', '-model', KATAGO_MODEL, '-config', KATAGO_CONFIG];
     }
 
     if (!fs.existsSync(bin)) {
-      throw new Error(`Engine binary not found: ${bin}. Run: npm run engines:download`);
+      const diag = EngineManager.diagnostics();
+      const detail = `Engine binary not found: ${bin}\n` +
+        `Run: npm run engines:download  (or  bash scripts/download-engines.sh)\n` +
+        `Diagnostics: ${JSON.stringify(diag, null, 2)}`;
+      throw new Error(detail);
     }
 
     const proc = spawn(bin, args, {
@@ -261,25 +337,32 @@ export class EngineManager {
     proc.on('exit', sess.procListeners.exit);
     proc.on('error', sess.procListeners.error);
 
-    // 等待引擎就绪
+    // 等待引擎就绪 — 使用并行选项发送以加速启动
     if (variant === 'go') {
       // KataGo GTP: 等 'GTP ready' 信号 (从 stderr 来)
       await this.waitFor(sess, /GTP ready/, 60000);
-      // 初始设置 board
+      // 初始设置 board — 顺序无所谓,因为 boardsize 后才能 clear_board,但 clear_board + komi 互相独立
+      // 引擎启动阶段不需要等 reply,直接 fire-and-forget 让分析请求时再校验
       this.sendLine(sess, 'boardsize 19');
       this.sendLine(sess, 'clear_board');
       this.sendLine(sess, 'komi 7.5');
-      // 等所有 reply
-      await this.waitFor(sess, /^[=?] /m, 5000).catch(() => {});
+      // 等所有 reply — 用更短超时,因为后续 kata-analyze 会自然触发 board 状态确认
+      await this.waitFor(sess, /^[=?] /m, 2000).catch(() => {});
       sess.gtpBoardSize = 19;
       sess.gtpPlayerColor = 'B';
+      // 暖身: 发一个 1 秒钟的 kata-analyze 让 KataGo 预热 GPU + NN 缓存
+      // 这样后续真实 analyze 命令可以更快出第一个 info 行
+      this.sendLine(sess, 'kata-analyze B 100');
+      await this.waitFor(sess, /^[=?] /m, 4000).catch(() => {});
     } else {
-      // UCI: 发送 'uci' 命令 + 等 uciok
+      // UCI: 发送 'uci' 命令 + 等 uciok — 并行设置选项以减少启动延迟
       this.sendLine(sess, 'uci');
       await this.waitFor(sess, /uciok/, 30000);
-      // 设置选项: MultiPV 3, Threads 4, Hash 128
+      // 串行设置: Stockfish/Pikafish 的选项必须在 isready 之前完成,否则会丢选项
       this.sendLine(sess, 'setoption name MultiPV value 3');
-      this.sendLine(sess, 'setoption name Threads value 8');
+      // Pikafish NNUE 引擎在 Apple Silicon 上吃单核;Threads>1 反而拖慢
+      const threads = variant === 'xiangqi' ? 1 : 8;
+      this.sendLine(sess, `setoption name Threads value ${threads}`);
       this.sendLine(sess, 'setoption name Hash value 128');
       // Pikafish NNUE: 显式指定 EvalFile 路径 (Pikafish 从 cwd 找 pikafish.nnue)
       if (variant === 'xiangqi') {
@@ -393,35 +476,27 @@ export class EngineManager {
   async newGame(variant: GameVariant, fen?: string): Promise<void> {
     const sess = await this.ensureStarted(variant);
     // Stop any ongoing analysis first (UCI engines ignore ucinewgame while searching).
-    // Use pendingCommand as the authoritative "engine is busy" flag — stopAnalyze()
-    // sets analyzing=false BEFORE the engine responds with bestmove, so we must
-    // also check pendingCommand to detect that the engine is still winding down.
-    if (sess.pendingCommand === 'uci-analyze' || sess.pendingCommand === 'gtp-analyze') {
-      try {
-        sess.proc.stdin?.write('stop\n');
-      } catch {}
-      // UCI: wait for bestmove so the engine is truly idle before sending new commands.
-      // GTP (KataGo): bestmove is not emitted on stop; a short delay suffices.
-      if (variant !== 'go') {
-        await this.waitFor(sess, /bestmove/, 5000).catch(() => {});
-      } else {
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    }
+    await this.stopOngoingAnalysis(variant);
     sess.uciPendingByPv.clear();
     sess.gtpPending = null;
     sess.currentAnalysis = undefined;
     sess.moveHistory = [];
 
     if (variant === 'go') {
+      // KataGo: 清空 board 后等回复,但 kata-analyze 已退出,reply 会正常到达
       this.sendLine(sess, 'boardsize 19');
       this.sendLine(sess, 'clear_board');
       this.sendLine(sess, 'komi 7.5');
-      await this.waitFor(sess, /^[=?] /m, 3000).catch(() => {});
+      await this.waitFor(sess, /^[=?] /m, 2000).catch(() => {});
       sess.gtpBoardSize = 19;
       sess.gtpPlayerColor = 'B';
       sess.ownershipRequested = false;
       sess.lastOwnership = null;
+      // 关键: 清空 board 后 KataGo 内部 NN 缓存可能 stale,发 kata-genmove_analyze
+      // 再发空行 (停 kata-analyze) 让 KataGo 完全清空自己的思考循环
+      this.sendLine(sess, 'kata-genmove_analyze B 1');
+      this.sendLine(sess, '\n'); // stop
+      await this.waitFor(sess, /^[=?] /m, 1500).catch(() => {});
     } else {
       this.sendLine(sess, 'ucinewgame');
       const startFen = fen ?? fenForVariant(variant);
@@ -429,6 +504,37 @@ export class EngineManager {
       this.sendLine(sess, `position fen ${startFen}`);
       this.sendLine(sess, 'isready');
       await this.waitFor(sess, /readyok/, 5000);
+    }
+  }
+
+  /** 私有: 强停任何正在跑的 analyze (await 引擎真正 idle) */
+  private async stopOngoingAnalysis(variant: GameVariant): Promise<void> {
+    const sess = this.sessions.get(`${variant}:default`);
+    if (!sess) return;
+    if (sess.pendingCommand !== 'uci-analyze' && sess.pendingCommand !== 'gtp-analyze') return;
+    if (process.env.CHESS_DEBUG) console.log(`[stopOngoingAnalysis] ${variant} pending=${sess.pendingCommand}`);
+    try {
+      sess.proc.stdin?.write(variant === 'go' ? '\n' : 'stop\n');
+    } catch {}
+    sess.analyzing = false;
+    if (variant !== 'go') {
+      await this.waitFor(sess, /bestmove/, 5000).catch(() => {});
+      const deadline = Date.now() + 4000;
+      while (sess.pendingCommand !== undefined && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    } else {
+      // KataGo: kata-analyze 是同步命令,发空行让它退出。
+      // 给 2000ms 等待 reply '= ' 或 'play '(kata-genmove_analyze 完成后)
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    sess.analyzing = false;
+    sess.pendingCommand = undefined;
+    // 唤醒可能还在死循环的 generator
+    if (sess.analyzeAbort) {
+      const ac = sess.analyzeAbort;
+      sess.analyzeAbort = undefined;
+      ac.abort();
     }
   }
 
@@ -441,18 +547,7 @@ export class EngineManager {
    */
   async applyMove(variant: GameVariant, move: string): Promise<{ legal: boolean }> {
     const sess = await this.ensureStarted(variant);
-    // Stop any ongoing analysis first — use pendingCommand so we catch the
-    // wind-down window after stopAnalyze() has cleared sess.analyzing.
-    if (sess.pendingCommand === 'uci-analyze' || sess.pendingCommand === 'gtp-analyze') {
-      try {
-        sess.proc.stdin?.write('stop\n');
-      } catch {}
-      if (variant !== 'go') {
-        await this.waitFor(sess, /bestmove/, 5000).catch(() => {});
-      } else {
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    }
+    await this.stopOngoingAnalysis(variant);
     if (variant === 'go') {
       const color = sess.gtpPlayerColor;
       // 监听 stderr 一行以检测 illegal move
@@ -463,8 +558,8 @@ export class EngineManager {
       sess.emitter.on('line', onLine);
       try {
         this.sendLine(sess, `play ${color} ${move}`);
-        // wait for "? " or "= " reply
-        await this.waitFor(sess, /^[=?] /m, 5000).catch(() => {});
+        // KataGo GTP 立刻回 reply (sync 内存 board),不需要等 kata-analyze 报告
+        await this.waitFor(sess, /^[=?] /m, 2000).catch(() => {});
         sess.gtpPlayerColor = color === 'B' ? 'W' : 'B';
         return { legal: !illegalDetected };
       } finally {
@@ -493,16 +588,7 @@ export class EngineManager {
    */
   async undoMove(variant: GameVariant): Promise<{ legal: boolean }> {
     const sess = await this.ensureStarted(variant);
-    if (sess.pendingCommand === 'uci-analyze' || sess.pendingCommand === 'gtp-analyze') {
-      try {
-        sess.proc.stdin?.write('stop\n');
-      } catch {}
-      if (variant !== 'go') {
-        await this.waitFor(sess, /bestmove/, 5000).catch(() => {});
-      } else {
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    }
+    await this.stopOngoingAnalysis(variant);
     if (variant === 'go') {
       this.sendLine(sess, 'undo');
       const ok = await this.waitFor(sess, /^[=?] /m, 5000).catch(() => null);
@@ -607,36 +693,31 @@ export class EngineManager {
     // wait for it to finish before sending a new 'go infinite'. Without this, Stockfish
     // ignores our new command. For UCI, send 'stop' and wait for bestmove. For GTP, give
     // the engine a moment to wind down.
-    if (sess.analyzing || sess.pendingCommand !== undefined) {
-      if (variant === 'go') {
-        try { sess.proc.stdin?.write('\n'); } catch {}
-        await new Promise((r) => setTimeout(r, 400));
-      } else {
-        try { sess.proc.stdin?.write('stop\n'); } catch {}
-        await this.waitFor(sess, /bestmove/, 8000).catch(() => {});
-        const deadline = Date.now() + 4000;
-        while (sess.pendingCommand !== undefined && Date.now() < deadline) {
-          await new Promise((r) => setTimeout(r, 50));
-        }
-      }
-      sess.analyzing = false;
-      sess.pendingCommand = undefined;
-    }
+    // 如果上一轮 analyze 还挂着 (race condition),强制退出 — 共用辅助函数避免重复逻辑
+    await this.stopOngoingAnalysis(variant);
 
     sess.analyzing = true;
 
     if (variant === 'go') {
       const color = sess.gtpPlayerColor;
-      const interval = 100; // ms — 100ms = 10 reports/s (fast updates, not overwhelming)
+      // Use kata-raw-nn 0 + lz-genmove_analyze in a loop? No — simpler: just use kata-analyze.
+      // The intervalCs is in centiseconds (1/100 s), so 100 = 1.0 s per report.
+      // Smaller intervals (e.g. 10 = 0.1s) cause KataGo to emit empty info lines.
+      const intervalCs = 100;
       sess.pendingCommand = 'gtp-analyze';
-      this.sendLine(sess, `kata-analyze ${color} ${interval / 10}`);
+      const cmd = `kata-analyze ${color} ${intervalCs}`;
+      this.sendLine(sess, cmd);
+      if (process.env.CHESS_DEBUG) console.log(`[analyze] sent: ${cmd}`);
+      // 给 KataGo 一个 tick 让命令进 stdio buffer
+      await new Promise((r) => setImmediate(r));
 
       // Event-driven queue: push every new gtpPending immediately when handleLine arrives
       const queue: Analysis[] = [];
       let resolveNext: ((v: Analysis | null) => void) | null = null;
       let stopped = false;
 
-      const onInfo = () => {
+      const onInfo = (parsed: any) => {
+        if (process.env.CHESS_DEBUG && Math.random() < 0.01) console.log(`[gtp-info] received, building analysis`);
         if (!sess.gtpPending) return;
         const analysis = buildGtpAnalysis({
           raw: sess.gtpPending,
@@ -656,10 +737,21 @@ export class EngineManager {
         }
       };
       sess.emitter.on('gtp-info', onInfo);
+      const abort = new AbortController();
+      sess.analyzeAbort = abort;
+      const onAbort = () => {
+        stopped = true;
+        if (resolveNext) {
+          const r = resolveNext;
+          resolveNext = null;
+          r(null);
+        }
+      };
+      abort.signal.addEventListener('abort', onAbort);
 
       try {
         // First yield ASAP: wait for the first 'gtp-info' event (no polling delay)
-        while (!stopped && Date.now() - startTime < 300_000) {
+        while (!stopped && !abort.signal.aborted && Date.now() - startTime < 300_000) {
           let next: Analysis | null = null;
           if (queue.length > 0) {
             next = queue.shift()!;
@@ -670,12 +762,14 @@ export class EngineManager {
           }
           if (!next) break;
           yield next;
-          if (!sess.analyzing) break;
+          if (!sess.analyzing || abort.signal.aborted) break;
         }
       } finally {
         stopped = true;
         sess.emitter.off('gtp-info', onInfo);
+        abort.signal.removeEventListener('abort', onAbort);
         sess.pendingCommand = undefined;
+        if (sess.analyzeAbort === abort) sess.analyzeAbort = undefined;
       }
     } else {
       const depth = opts.depth ?? 22;
@@ -722,9 +816,22 @@ export class EngineManager {
       };
       sess.emitter.on('analysis', onAnalysis);
       sess.emitter.on('bestmove', onBest);
+      const abort = new AbortController();
+      sess.analyzeAbort = abort;
+      // 当 abort 被触发时,让正在等待 next 的 Promise 立刻以 null resolve,
+      // 不然 generator 卡在 await Promise 上无法退出
+      const onAbort = () => {
+        stopped = true;
+        if (resolveNext) {
+          const r = resolveNext;
+          resolveNext = null;
+          r(null);
+        }
+      };
+      abort.signal.addEventListener('abort', onAbort);
 
       try {
-        while (!stopped && sess.analyzing && Date.now() - startTime < 300_000) {
+        while (!stopped && sess.analyzing && !abort.signal.aborted && Date.now() - startTime < 300_000) {
           let next: Analysis | null = null;
           if (queue.length > 0) {
             next = queue.shift()!;
@@ -740,7 +847,9 @@ export class EngineManager {
         stopped = true;
         sess.emitter.off('analysis', onAnalysis);
         sess.emitter.off('bestmove', onBest);
+        abort.signal.removeEventListener('abort', onAbort);
         sess.pendingCommand = undefined;
+        if (sess.analyzeAbort === abort) sess.analyzeAbort = undefined;
       }
     }
     sess.analyzing = false;
@@ -753,13 +862,20 @@ export class EngineManager {
     if (sess.pendingCommand === undefined) return Promise.resolve();
 
     sess.analyzing = false;
+    // 信号 abort: 唤醒 generator 的 while 循环
+    if (sess.analyzeAbort) {
+      const ac = sess.analyzeAbort;
+      sess.analyzeAbort = undefined;
+      ac.abort();
+    }
 
     if (variant === 'go') {
       try { sess.proc.stdin?.write('\n'); } catch {}
-      setTimeout(() => {
-        sess.pendingCommand = undefined;
-        sess.idleResolve?.();
-      }, 300);
+      // KataGo: 等 reply '= ' 或 '? ' 出现,确认 kata-analyze 已退出
+      // kata-analyze 是同步命令(发空行才会停),它的 reply '= ' 也会随之到达
+      this.waitFor(sess, /^[=?] /m, 1500).catch(() => {});
+      sess.pendingCommand = undefined;
+      sess.idleResolve?.();
       return Promise.resolve();
     }
 
