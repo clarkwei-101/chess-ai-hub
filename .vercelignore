@@ -4,20 +4,18 @@ out/
 *.log
 .env.local
 .env*.local
-engines/stockfish
-engines/pikafish
-engines/katago
-engines/katago*
-engines/networks/
-!engines/.gitkeep
-pikafish.nnue
 .DS_Store
 *.tsbuildinfo
 .idea/
 .vscode/
 coverage/
 .vercel
-.next/cache
 **/__pycache__/
 *.pyc
 *.pyo
+# Engine binaries — too big for Vercel function limit
+engines/
+pikafish.nnue
+*.nnue
+# Local-only artifacts
+extension/

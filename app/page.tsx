@@ -93,10 +93,45 @@ export default function HomePage() {
             <Divider />
             <Stat label="Speed" value="ms" />
             <Divider />
-            <Stat label="Local-only" value="✓" />
+            <Stat label="Mode" value="Local" />
           </div>
         </motion.div>
       </section>
+
+      {/* Demo Mode Banner — shown when engines unavailable (e.g. serverless deploy) */}
+      {health && !health.chess && !health.xiangqi && !health.go && (
+        <section className="max-w-7xl mx-auto px-6 pb-6">
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.4 }}
+            className="glass rounded-2xl px-6 py-4 border-cyan-500/20 flex flex-col md:flex-row items-start md:items-center gap-3"
+          >
+            <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center shrink-0">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-cyan-400">
+                <circle cx="12" cy="12" r="10"/>
+                <path d="M12 8v4M12 16h.01"/>
+              </svg>
+            </div>
+            <div className="flex-1">
+              <div className="text-silver-primary text-sm font-medium">Demo Mode · UI Preview</div>
+              <div className="text-silver-dim text-xs mt-0.5">
+                This serverless build ships the UI only — engine binaries are not bundled. Clone the repo and run{' '}
+                <code className="px-1.5 py-0.5 rounded bg-black-elevated text-cyan-300 font-mono text-[11px]">npm run engines:download && npm run dev</code>{' '}
+                locally to play against Stockfish / Pikafish / KataGo.
+              </div>
+            </div>
+            <a
+              href="https://github.com/clarkwei-101/chess-ai-hub"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-cyan-400 hover:text-cyan-300 whitespace-nowrap flex items-center gap-1"
+            >
+              View on GitHub →
+            </a>
+          </motion.div>
+        </section>
+      )}
 
       {/* Game Selector */}
       <section className="max-w-7xl mx-auto px-6 pb-24">
