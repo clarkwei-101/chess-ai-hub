@@ -46,7 +46,9 @@ const GAMES = [
 
 export default function HomePage() {
   const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [mounted, setMounted] = useState(false);
 
+  useEffect(() => { setMounted(true); }, []);
   useEffect(() => {
     fetch('/api/engine/health')
       .then((r) => r.json())
@@ -260,7 +262,9 @@ export default function HomePage() {
             <HealthDot name="Pikafish 2026" ready={!!health?.xiangqi} />
             <HealthDot name="KataGo v1.18.1" ready={!!health?.go} />
           </div>
-          <span>localhost:{typeof window !== 'undefined' ? window.location.port : '3002'} · {new Date().getFullYear()}</span>
+          <span suppressHydrationWarning>
+            {mounted ? `localhost:${typeof window !== 'undefined' ? window.location.port : '3002'}` : 'localhost:3002'} · {new Date().getFullYear()}
+          </span>
         </div>
       </footer>
     </main>
