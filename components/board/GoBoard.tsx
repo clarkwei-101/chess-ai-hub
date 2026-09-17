@@ -6,6 +6,8 @@ import { GoBoard as GoBoardType, GoStone, goInitialBoard, isLegalGoMove, applyGo
 
 interface GoBoardProps {
   analysis: Analysis | null;
+  /** Ownership heatmap from kata-ownership (P1-7 fix: separate SSE event after kata-analyze completes) */
+  ownership?: number[][] | null;
   playerSide: 'black' | 'white';
   onMove: (move: string, san: string) => void;
   lastMove: string | null;
@@ -21,6 +23,9 @@ interface GoBoardProps {
   isPlayerTurn?: boolean;
 }
 
+// Responsive sizing: native 664x664 viewBox, but rendered to fill the
+// parent column. At <sm viewports the parent scales the container down
+// (CSS scale transform) so the board never overflows or hides controls.
 const BOARD_SIZE = 19;
 const CELL = 32;
 const MARGIN = 28;
@@ -39,7 +44,7 @@ function gtpToCoord(move: string): { row: number; col: number } | null {
   return { row: rowNum - 1, col };
 }
 
-export function GoBoard({ analysis, playerSide, onMove, lastMove, moves, onPass, onResign, onUndo, isPlayerTurn }: GoBoardProps) {
+export function GoBoard({ analysis, ownership, playerSide, onMove, lastMove, moves, onPass, onResign, onUndo, isPlayerTurn }: GoBoardProps) {
   // 派生 board: 从 moves 列表回放 (保证用户和 AI 的着法都同步到 UI)
   const derived = useMemo(() => {
     let b: GoBoardType = goInitialBoard(BOARD_SIZE);
@@ -75,7 +80,16 @@ export function GoBoard({ analysis, playerSide, onMove, lastMove, moves, onPass,
   const [turn, setTurn] = useState<'B' | 'W'>(derived.turn);
   const [koPoint, setKoPoint] = useState<{ r: number; c: number } | undefined>(derived.koPoint);
   const [captured, setCaptured] = useState<{ B: number; W: number }>(derived.captured);
-  const [passes, setPasses] = useState(0); // 连续 pass 次数 (2 = 和棋)
+  // P0-2 fix: 从 moves 列表 derive 连续 pass 计数 (永远跟着 derived 同步)
+  const consecutivePasses = useMemo(() => {
+    if (!moves || moves.length === 0) return 0;
+    let count = 0;
+    for (let i = moves.length - 1; i >= 0; i--) {
+      if (moves[i].move === 'pass') count++;
+      else break;
+    }
+    return count;
+  }, [moves]);
 
   // 当 derived 变化 (外部 moves 更新) 时,同步本地 state
   useEffect(() => {
@@ -156,7 +170,10 @@ export function GoBoard({ analysis, playerSide, onMove, lastMove, moves, onPass,
   }
 
   return (
-    <div className="relative" style={{ width: SIZE, height: SIZE }}>
+    <div
+      className="relative w-full max-w-[664px] aspect-square mx-auto"
+      style={{ aspectRatio: '1 / 1' }}
+    >
       {/* 顶部状态栏: 提子数 + 连续 pass */}
       <div className="absolute -top-9 left-0 right-0 flex items-center justify-between text-[10px] text-silver-dim font-mono">
         <div className="flex items-center gap-3">
@@ -164,14 +181,14 @@ export function GoBoard({ analysis, playerSide, onMove, lastMove, moves, onPass,
           <span className="text-silver-dark">·</span>
           <span>白提: {captured.W}</span>
         </div>
-        {passes >= 1 && (
-          <span className={`px-2 py-0.5 rounded ${passes >= 2 ? 'bg-amber-500/20 text-amber-300' : 'bg-silver-mid/10 text-silver-mid'}`}>
-            {passes >= 2 ? '双 Pass · 和棋' : 'Pass · 等待对手'}
+        {consecutivePasses >= 1 && (
+          <span className={`px-2 py-0.5 rounded ${consecutivePasses >= 2 ? 'bg-amber-500/20 text-amber-300' : 'bg-silver-mid/10 text-silver-mid'}`}>
+            {consecutivePasses >= 2 ? '双 Pass · 和棋' : 'Pass · 等待对手'}
           </span>
         )}
       </div>
 
-      <svg viewBox={`0 0 ${SIZE} ${SIZE}`} className="rounded-md shadow-2xl shadow-black" style={{ background: '#0E0E10' }}>
+      <svg viewBox={`0 0 ${SIZE} ${SIZE}`} preserveAspectRatio="xMidYMid meet" className="w-full h-full rounded-md shadow-2xl shadow-black block" style={{ background: '#0E0E10' }}>
         {/* 棋盘底色 */}
         <rect width={SIZE} height={SIZE} fill="#1A1A1A" />
         <rect x={MARGIN - 6} y={MARGIN - 6} width={SIZE - 2 * MARGIN + 12} height={SIZE - 2 * MARGIN + 12} fill="#D4A574" />
@@ -196,6 +213,35 @@ export function GoBoard({ analysis, playerSide, onMove, lastMove, moves, onPass,
               />
             );
           }),
+        )}
+
+        {/* Ownership 热力图 (kata-ownership: P1-7 fix)
+            Blue = Black territory (positive), Red = White territory (negative)
+            Ownership from SSE 'ownership' event is merged with analysis?.ownership */}
+        {(ownership ?? analysis?.ownership) && (
+          (ownership ?? analysis?.ownership)!.map((row, r) =>
+            row.map((v, c) => {
+              const abs = Math.abs(v);
+              if (abs < 0.1) return null; // threshold: ignore near-neutral
+              const intensity = Math.min(0.35, abs * 0.5);
+              const x = MARGIN + c * CELL;
+              const y = MARGIN + r * CELL;
+              // positive = Black territory (blue), negative = White territory (red)
+              const color = v > 0 ? '#3B82F6' : '#EF4444';
+              return (
+                <rect
+                  key={`own-${r}-${c}`}
+                  x={x - CELL / 2 + 2}
+                  y={y - CELL / 2 + 2}
+                  width={CELL - 4}
+                  height={CELL - 4}
+                  fill={color}
+                  opacity={intensity}
+                  rx={3}
+                />
+              );
+            }),
+          )
         )}
 
         {/* 网格线 */}

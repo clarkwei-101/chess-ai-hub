@@ -23,6 +23,8 @@ export function ChessBoard({ analysis, playerSide, onMove, lastMove, fen, isPlay
   const [chess] = useState(() => new Chess());
   const [, force] = useState(0);
   const [selected, setSelected] = useState<string | null>(null);
+  // Responsive square size — SVG scales to fill the container, viewBox stays at native 480.
+  // Each cell = 480/8 = 60 in viewBox units regardless of rendered size.
   const squareSize = SIZE / 8;
 
   // Sync internal chess.js state to the externally-supplied FEN.
@@ -81,10 +83,11 @@ export function ChessBoard({ analysis, playerSide, onMove, lastMove, fen, isPlay
   const bestMove = analysis?.multiPv[0]?.move;
 
   return (
-    <div className="relative" style={{ width: SIZE, height: SIZE }}>
+    <div className="relative w-full max-w-[480px] mx-auto" style={{ aspectRatio: '1 / 1' }}>
       <svg
         viewBox={`0 0 ${SIZE} ${SIZE}`}
-        className="rounded-md shadow-2xl shadow-black"
+        preserveAspectRatio="xMidYMid meet"
+        className="w-full h-full rounded-md shadow-2xl shadow-black block"
         style={{ background: '#0E0E10' }}
       >
         {/* 棋盘格子 */}

@@ -21,3 +21,9 @@ coverage/
 **/__pycache__/
 *.pyc
 *.pyo
+
+# Debug scripts (kept locally only)
+debug_katago.js
+debug_katago.ts
+.go-ai-server.pid
+scripts/_*.py

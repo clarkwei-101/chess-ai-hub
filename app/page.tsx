@@ -133,6 +133,38 @@ export default function HomePage() {
         </section>
       )}
 
+      {/* Demo Mode Entry — always visible (works on serverless) */}
+      <section className="max-w-7xl mx-auto px-6 pb-6">
+        <Link href="/go-demo">
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.4, delay: 0.05 }}
+            className="group glass rounded-2xl px-6 py-4 border-cyan-500/30 hover:border-cyan-400/60 transition-all cursor-pointer relative overflow-hidden"
+          >
+            <div className="absolute inset-0 bg-gradient-to-r from-cyan-500/5 via-blue-500/5 to-purple-500/5 opacity-0 group-hover:opacity-100 transition-opacity" />
+            <div className="relative z-10 flex flex-col md:flex-row md:items-center gap-3">
+              <div className="w-10 h-10 rounded-lg bg-cyan-500/10 border border-cyan-500/40 flex items-center justify-center shrink-0">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-cyan-400">
+                  <circle cx="12" cy="12" r="10"/>
+                  <path d="M8 12l3 3 5-5"/>
+                </svg>
+              </div>
+              <div className="flex-1">
+                <div className="text-silver-primary text-sm font-medium">Try Demo Mode · 围棋复盘</div>
+                <div className="text-silver-dim text-xs mt-0.5">
+                  Lee Sedol vs AlphaGo · Game 4 「神之一手」 — 50 手完整复盘,KataGo 风格分析,无需引擎二进制
+                </div>
+              </div>
+              <span className="text-cyan-400 text-sm font-medium flex items-center gap-1">
+                进入复盘
+                <span className="text-xl group-hover:translate-x-1 transition-transform">→</span>
+              </span>
+            </div>
+          </motion.div>
+        </Link>
+      </section>
+
       {/* Game Selector */}
       <section className="max-w-7xl mx-auto px-6 pb-24">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">

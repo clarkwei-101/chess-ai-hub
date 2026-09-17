@@ -133,7 +133,6 @@ interface DualClockProps {
 export function DualClock({ activeSide, playerSec, aiSec, playerLabel, aiLabel, playerFlag, aiFlag, paused = false }: DualClockProps) {
   const [p, setP] = useState(playerSec);
   const [a, setA] = useState(aiSec);
-  const lastActiveRef = useRef<'player' | 'ai'>(activeSide);
 
   // Sync from props when they change (e.g. time control reset)
   useEffect(() => { setP(playerSec); }, [playerSec]);

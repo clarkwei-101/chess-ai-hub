@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Chess } from 'chess.js';
 import { ChessBoard } from './ChessBoard';
@@ -13,6 +13,7 @@ import { SideSelector } from '../side/SideSelector';
 import { StyleSelector } from '../side/StyleSelector';
 import { DualClock } from '../control/ChessClock';
 import { checkChessGameOver, checkGoGameOver, checkXiangqiGameOver, GameOverResult } from '@/lib/rules/game-over';
+import { classifyMoveList, ClassifiedMove, getClassificationColor, getClassificationLabel } from '@/lib/analysis/move-classification';
 import { Analysis, GameVariant, MoveRecord, Side } from '@/lib/types';
 
 const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
@@ -32,6 +33,7 @@ const DEFAULT_TIME_CONTROL = {
 export function GameClient({ variant, sides, defaultSide, engine }: GameClientProps) {
   const [playerSide, setPlayerSide] = useState<Side>(defaultSide);
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
+  const [ownership, setOwnership] = useState<number[][] | null>(null);
   const [moves, setMoves] = useState<MoveRecord[]>([]);
   const [engineStatus, setEngineStatus] = useState<'idle' | 'starting' | 'ready' | 'thinking' | 'errored'>('idle');
   const [error, setError] = useState<string | null>(null);
@@ -48,9 +50,19 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
   const playerLockedRef = useRef(false);
   const initialGameStartedRef = useRef(false);
   const openingTriggeredRef = useRef(false);
+  // Track consecutive passes for Go (game over = both pass)
+  const consecutivePassesRef = useRef(0);
   // Always-current moves ref to avoid stale closure in aiMove callbacks
   const movesRef = useRef<typeof moves>(moves);
   movesRef.current = moves;
+  // P1-1 fix: 缓存每步走子瞬间的 analysis snapshot,这样 classifyMoveList 用的是该步
+  // 走完后的 analysis,而不是后续更新覆盖后的最新值。key = ply,value = Analysis at that ply.
+  const analysisAtPlyRef = useRef<Map<number, typeof analysis>>(new Map());
+  // AI's current analysis = top moves visible to player right now. We capture this
+  // BEFORE applying a new move so the previous step's classification uses the AI's
+  // recommendation at that moment.
+  const analysisRef = useRef<typeof analysis>(null);
+  analysisRef.current = analysis;
   // Always-current player side (used inside callbacks that already have movesRef)
   const playerSideRef = useRef<Side>(playerSide);
   playerSideRef.current = playerSide;
@@ -87,6 +99,15 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
       });
       const j = await r.json();
       if (!j.ok) throw new Error(j.error);
+      if (j.data?.status === 'unavailable') {
+        // Engine binaries missing — show friendly banner instead of crashing
+        setEngineStatus('errored');
+        setError(
+          `${variant.toUpperCase()} engine is not available in this environment. ` +
+            `Use Demo Mode at /${variant === 'go' ? 'go' : variant}-demo for offline play with pre-recorded analysis.`,
+        );
+        return;
+      }
       // 启动后立即 apply default style (避免 first aiMove 用错 hint)
       await fetch('/api/engine/set-style', {
         method: 'POST',
@@ -135,6 +156,7 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
       aiPendingRef.current = false;
       playerLockedRef.current = false;
       openingTriggeredRef.current = false;
+      if (variant === 'go') consecutivePassesRef.current = 0;
       setBoardKey((k) => k + 1);
       setGameOver(null);
       setError(null);
@@ -180,9 +202,64 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
     es.onerror = () => {
       setEngineStatus('ready');
     };
+    // P1-7 fix: Handle named 'ownership' SSE event from analyze route.
+    // After kata-analyze completes, the SSE route calls kata-ownership and sends the result
+    // as a named event. This updates the GoBoard heatmap without re-triggering analysis.
+    es.addEventListener('ownership', (e) => {
+      try {
+        const { ownership } = JSON.parse(e.data);
+        setOwnership(ownership);
+      } catch {}
+    });
   }, [variant]);
 
-  // AI 生成下一步
+  // Request KataGo territory scoring (for Go double-pass end game)
+  const requestGoFinalScore = useCallback(async () => {
+    if (variant !== 'go') return;
+    try {
+      const r = await fetch('/api/engine/final-score', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ variant }),
+      });
+      const j = await r.json();
+      if (j.ok && j.data?.score) {
+        const s = j.data.score;
+        const winner: 'player' | 'ai' | 'draw' =
+          s.winner === '?' ? 'draw' :
+          (playerSide === 'black' ? (s.winner === 'B' ? 'player' : 'ai') :
+            (s.winner === 'W' ? 'player' : 'ai'));
+        if (s.resign) {
+          // Resignation: winner won by resignation
+          setGameOver({
+            over: true,
+            reason: 'resign',
+            winner,
+            detail: winner === 'player' ? '对手认输 · 你赢了' : '你认输 · AI 赢了',
+          });
+        } else if (s.winner === '?' || s.score === 0) {
+          setGameOver({ over: true, reason: 'pass-tied', winner: 'draw', detail: '和棋' });
+        } else {
+          // Territory scoring
+          const komi = 7.5;
+          const adjustedScore = s.score - (s.winner === 'W' ? komi : 0);
+          setGameOver({
+            over: true,
+            reason: 'points',
+            winner,
+            detail: s.winner === 'B'
+              ? `黑胜 ${Math.abs(adjustedScore).toFixed(1)} 目`
+              : `白胜 ${Math.abs(adjustedScore).toFixed(1)} 目(含7.5目贴目)`,
+          });
+        }
+      } else {
+        // Fallback: show draw
+        setGameOver({ over: true, reason: 'pass-tied', winner: 'draw', detail: '双 Pass · 终局计分失败，显示和棋' });
+      }
+    } catch {
+      setGameOver({ over: true, reason: 'pass-tied', winner: 'draw', detail: '双 Pass · 计分请求失败' });
+    }
+  }, [variant, playerSide]);
   const aiMove = useCallback(async () => {
     if (aiPendingRef.current) return;
     if (gameOver?.over) return;
@@ -232,10 +309,21 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
         ...prev,
         { ply: plyRef.current, move: aiMoveStr, san: aiMoveStr, winRate: analysis?.winRate },
       ]);
-      // Go 终局检测
+      // P1-1 fix: 缓存本步之前的 analysis snapshot → 该步的分类用此值而非后续覆盖。
+      analysisAtPlyRef.current.set(plyRef.current, analysis ?? null);
+      // Go 终局检测 — 用 consecutivePassesRef 追踪连续 pass，双 pass 时请求 KataGo 计分
       if (variant === 'go') {
-        const over = checkGoGameOver([...moves, aiMoveStr].map((m) => m.move));
-        if (over.over) setGameOver(over);
+        if (aiMoveStr === 'pass') {
+          consecutivePassesRef.current++;
+        } else {
+          consecutivePassesRef.current = 0;
+        }
+        if (consecutivePassesRef.current >= 2) {
+          await requestGoFinalScore();
+        } else {
+          const over = checkGoGameOver([...moves, aiMoveStr].map((m) => m.move));
+          if (over.over) setGameOver(over);
+        }
       }
       if (variant === 'xiangqi') {
         const over = checkXiangqiGameOver([...moves, aiMoveStr].map((m) => m.move));
@@ -248,7 +336,7 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
       aiPendingRef.current = false;
       setEngineStatus('ready');
     }
-  }, [analysis, variant, styleId, gameOver, moves, startAnalysisStream]);
+  }, [analysis, variant, styleId, gameOver, moves, startAnalysisStream, requestGoFinalScore]);
 
   // 用户落子
   const onUserMove = useCallback(
@@ -293,6 +381,9 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
           winRate: analysis?.winRate,
           scoreCp: analysis?.scoreCp,
         };
+        if (variant === 'go') consecutivePassesRef.current = 0;
+        // P1-1 fix: 缓存本步之前的 analysis snapshot → 该步的分类用此值。
+        analysisAtPlyRef.current.set(plyRef.current, analysis ?? null);
         setMoves((prev) => [...prev, record]);
         startAnalysisStream();
         // AI 回应
@@ -335,6 +426,7 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
       setCurrentFen(chessRef.current.fen());
       setMoves((prev) => prev.slice(0, -okCount));
       plyRef.current = Math.max(0, plyRef.current - okCount);
+      if (variant === 'go') consecutivePassesRef.current = 0;
       setGameOver(null);
       startAnalysisStream();
     } catch (e: any) {
@@ -348,6 +440,8 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
     if (playerLockedRef.current) return;
     if (gameOver?.over) return;
     playerLockedRef.current = true;
+    // Track consecutive passes for Go double-pass detection
+    if (variant === 'go') consecutivePassesRef.current++;
     try {
       const r = await fetch('/api/engine/move', {
         method: 'POST',
@@ -420,6 +514,32 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
   })();
   const playerFlag = variant === 'go' ? 'GO' : variant === 'xiangqi' ? 'CN' : 'CN';
   const aiFlag = styleId === 'default' ? 'AI' : styleId.toUpperCase().slice(0, 4);
+
+  const moveClassifications = useMemo(() => {
+    // P1-1 fix: 用每步走子瞬间 (即 SSE 之前) 的 analysis snapshot 分类。
+    // 捕获策略: 在 onUserMove / aiMove 里,向 server 发送着法前,把当时的
+    // analysis 存进 analysisAtPlyRef[ply]。这样 classify 拿到的就是该步
+    // 走子前引擎推荐的 top moves,而非后续 SSE 更新覆盖后的最新值。
+    return classifyMoveList(
+      moves.map((m) => {
+        // m.ply 对应的 analysis = 走该步前引擎推荐的 top moves
+        const a = analysisAtPlyRef.current.get(m.ply) ?? analysisRef.current ?? null;
+        return {
+          move: m.move,
+          san: m.san,
+          winRate: m.winRate,
+          scoreCp: m.scoreCp,
+          scoreLead: m.scoreLead,
+          analysisMultiPv: a?.multiPv?.map((p) => p.move),
+          variant,
+        };
+      }),
+      {
+        // 简单棋谱标签: 前 8 着视为定式 (Book)
+        isBookMove: (_m, i) => i < 8 && variant !== 'chess',
+      },
+    );
+  }, [moves, variant]);
 
   return (
     <main className="min-h-screen bg-black-deep">
@@ -519,14 +639,194 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
       </AnimatePresence>
 
       {/* Main Game Layout */}
-      <div className="max-w-[1600px] mx-auto px-6 py-6 grid grid-cols-1 lg:grid-cols-[1fr_420px_360px] gap-6">
-        {/* Board */}
-        <div className="flex items-start justify-center">
+      {/* Layout decisions:
+          - <xl (≥1280px): 3 columns [board 1fr] [analysis 420px] [history 360px]
+            Board column has min-w-0 so the SVG inside can shrink to fit,
+            and the SVG is responsive (see GoBoard / ChessBoard / XiangqiBoard).
+          - <lg: 2 columns: board + history, analysis stacks below
+          - <lg: single column */}
+      <div className="max-w-[1600px] mx-auto px-4 py-6">
+        {/* Desktop 3-col */}
+        <div className="hidden xl:grid grid-cols-[minmax(0,1fr)_420px_360px] gap-6 items-start">
+          <div className="flex justify-center">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ duration: 0.4 }}
+              className="glass rounded-2xl p-4 w-full flex justify-center"
+            >
+              {variant === 'chess' && (
+                <ChessBoard
+                  key={boardKey}
+                  analysis={analysis}
+                  playerSide={playerSide as 'white' | 'black'}
+                  onMove={onUserMove}
+                  lastMove={moves.length > 0 ? moves[moves.length - 1].move : null}
+                  fen={currentFen}
+                  isPlayerTurn={activeSide === 'player'}
+                />
+              )}
+              {variant === 'xiangqi' && (
+                <XiangqiBoard
+                  key={boardKey}
+                  analysis={analysis}
+                  playerSide={playerSide as 'red' | 'black'}
+                  onMove={onUserMove}
+                  lastMove={moves.length > 0 ? moves[moves.length - 1].move : null}
+                  moves={moves}
+                  isPlayerTurn={activeSide === 'player'}
+                />
+              )}
+              {variant === 'go' && (
+                <GoBoard
+                  key={boardKey}
+                  analysis={analysis}
+                  ownership={ownership}
+                  playerSide={playerSide as 'black' | 'white'}
+                  onMove={onUserMove}
+                  onPass={onPass}
+                  onResign={onResign}
+                  onUndo={onUndo}
+                  lastMove={moves.length > 0 ? moves[moves.length - 1].move : null}
+                  moves={moves}
+                  isPlayerTurn={activeSide === 'player'}
+                />
+              )}
+            </motion.div>
+          </div>
+
+          {/* Analysis Panel */}
+          <div className="space-y-4">
+            <DualClock
+              activeSide={activeSide}
+              playerSec={DEFAULT_TIME_CONTROL.initialSec}
+              aiSec={DEFAULT_TIME_CONTROL.initialSec}
+              playerLabel={playerLabel}
+              aiLabel={`${aiLabel} · ${styleId !== 'default' ? styleId.toUpperCase().slice(0, 8) : 'AI'}`}
+              playerFlag={playerFlag}
+              aiFlag={aiFlag}
+              paused={gameOver?.over ?? false}
+            />
+
+            <div className="glass rounded-2xl p-5">
+              <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Win Rate · From Your Side</div>
+              <WinRateBar
+                value={analysis?.winRate ?? 0.5}
+                label={`${analysis ? Math.round(analysis.winRate * 100) : 50}%`}
+                sublabel={analysis?.scoreCp !== undefined ? formatScore(analysis.scoreCp) : '—'}
+              />
+            </div>
+
+            <div className="glass rounded-2xl p-5">
+              <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Top Candidates</div>
+              <MoveList
+                lines={analysis?.multiPv ?? []}
+                variant={variant}
+                onPick={(move) => onUserMove(move, move)}
+              />
+            </div>
+
+            <div className="glass rounded-2xl p-5">
+              <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Why this move?</div>
+              <Explanation analysis={analysis} variant={variant} />
+            </div>
+          </div>
+
+          {/* Move History */}
+          <div className="glass rounded-2xl p-5 max-h-[calc(100vh-180px)] overflow-y-auto">
+            <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Move History</div>
+            <MoveHistory moves={moves} variant={variant} classifications={moveClassifications} />
+          </div>
+        </div>
+
+        {/* Tablet 2-col: board + analysis below, history right */}
+        <div className="hidden lg:grid xl:hidden grid-cols-[minmax(0,1fr)_340px] gap-6 items-start">
+          <div className="flex flex-col items-center gap-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              transition={{ duration: 0.4 }}
+              className="glass rounded-2xl p-4 w-full flex justify-center"
+            >
+              {variant === 'chess' && (
+                <ChessBoard
+                  key={boardKey}
+                  analysis={analysis}
+                  playerSide={playerSide as 'white' | 'black'}
+                  onMove={onUserMove}
+                  lastMove={moves.length > 0 ? moves[moves.length - 1].move : null}
+                  fen={currentFen}
+                  isPlayerTurn={activeSide === 'player'}
+                />
+              )}
+              {variant === 'xiangqi' && (
+                <XiangqiBoard
+                  key={boardKey}
+                  analysis={analysis}
+                  playerSide={playerSide as 'red' | 'black'}
+                  onMove={onUserMove}
+                  lastMove={moves.length > 0 ? moves[moves.length - 1].move : null}
+                  moves={moves}
+                  isPlayerTurn={activeSide === 'player'}
+                />
+              )}
+              {variant === 'go' && (
+                <GoBoard
+                  key={boardKey}
+                  analysis={analysis}
+                  ownership={ownership}
+                  playerSide={playerSide as 'black' | 'white'}
+                  onMove={onUserMove}
+                  onPass={onPass}
+                  onResign={onResign}
+                  onUndo={onUndo}
+                  lastMove={moves.length > 0 ? moves[moves.length - 1].move : null}
+                  moves={moves}
+                  isPlayerTurn={activeSide === 'player'}
+                />
+              )}
+            </motion.div>
+
+            {/* Analysis under board on tablet */}
+            <div className="w-full max-w-[680px] grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="glass rounded-2xl p-4">
+                <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Win Rate · From Your Side</div>
+                <WinRateBar
+                  value={analysis?.winRate ?? 0.5}
+                  label={`${analysis ? Math.round(analysis.winRate * 100) : 50}%`}
+                  sublabel={analysis?.scoreCp !== undefined ? formatScore(analysis.scoreCp) : '—'}
+                />
+              </div>
+              <div className="glass rounded-2xl p-4">
+                <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Top Candidates</div>
+                <MoveList
+                  lines={analysis?.multiPv ?? []}
+                  variant={variant}
+                  onPick={(move) => onUserMove(move, move)}
+                />
+              </div>
+            </div>
+
+            <div className="w-full max-w-[680px] glass rounded-2xl p-4">
+              <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Why this move?</div>
+              <Explanation analysis={analysis} variant={variant} />
+            </div>
+          </div>
+
+          {/* Move History right on tablet */}
+          <div className="glass rounded-2xl p-4 max-h-[calc(100vh-180px)] overflow-y-auto">
+            <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Move History</div>
+            <MoveHistory moves={moves} variant={variant} classifications={moveClassifications} />
+          </div>
+        </div>
+
+        {/* Mobile: single column */}
+        <div className="lg:hidden flex flex-col items-center gap-4 px-2">
           <motion.div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             transition={{ duration: 0.4 }}
-            className="glass rounded-2xl p-4 lg:p-6"
+            className="glass rounded-2xl p-3 w-full flex justify-center"
           >
             {variant === 'chess' && (
               <ChessBoard
@@ -554,6 +854,7 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
               <GoBoard
                 key={boardKey}
                 analysis={analysis}
+                ownership={ownership}
                 playerSide={playerSide as 'black' | 'white'}
                 onMove={onUserMove}
                 onPass={onPass}
@@ -565,31 +866,8 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
               />
             )}
           </motion.div>
-        </div>
 
-        {/* Analysis Panel + Clock (middle) */}
-        <div className="space-y-4">
-          <DualClock
-            activeSide={activeSide}
-            playerSec={DEFAULT_TIME_CONTROL.initialSec}
-            aiSec={DEFAULT_TIME_CONTROL.initialSec}
-            playerLabel={playerLabel}
-            aiLabel={`${aiLabel} · ${styleId !== 'default' ? styleId.toUpperCase().slice(0, 8) : 'AI'}`}
-            playerFlag={playerFlag}
-            aiFlag={aiFlag}
-            paused={gameOver?.over ?? false}
-          />
-
-          <div className="glass rounded-2xl p-5">
-            <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Win Rate · From Your Side</div>
-            <WinRateBar
-              value={analysis?.winRate ?? 0.5}
-              label={`${analysis ? Math.round(analysis.winRate * 100) : 50}%`}
-              sublabel={analysis?.scoreCp !== undefined ? formatScore(analysis.scoreCp) : '—'}
-            />
-          </div>
-
-          <div className="glass rounded-2xl p-5">
+          <div className="w-full max-w-[680px] glass rounded-2xl p-4">
             <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Top Candidates</div>
             <MoveList
               lines={analysis?.multiPv ?? []}
@@ -598,16 +876,24 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
             />
           </div>
 
-          <div className="glass rounded-2xl p-5">
+          <div className="w-full max-w-[680px] glass rounded-2xl p-4">
+            <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Win Rate · From Your Side</div>
+            <WinRateBar
+              value={analysis?.winRate ?? 0.5}
+              label={`${analysis ? Math.round(analysis.winRate * 100) : 50}%`}
+              sublabel={analysis?.scoreCp !== undefined ? formatScore(analysis.scoreCp) : '—'}
+            />
+          </div>
+
+          <div className="w-full max-w-[680px] glass rounded-2xl p-4">
             <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Why this move?</div>
             <Explanation analysis={analysis} variant={variant} />
           </div>
-        </div>
 
-        {/* Move History (right) */}
-        <div className="glass rounded-2xl p-5 max-h-[calc(100vh-180px)] overflow-y-auto">
-          <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Move History</div>
-          <MoveHistory moves={moves} variant={variant} />
+          <div className="w-full max-w-[680px] glass rounded-2xl p-4 max-h-[40vh] overflow-y-auto">
+            <div className="text-xs text-silver-dim uppercase tracking-wider mb-3">Move History</div>
+            <MoveHistory moves={moves} variant={variant} classifications={moveClassifications} />
+          </div>
         </div>
       </div>
     </main>
@@ -626,21 +912,52 @@ function formatScore(cp: number): string {
   return `${pawns >= 0 ? '+' : ''}${pawns.toFixed(2)}`;
 }
 
-function MoveHistory({ moves, variant }: { moves: MoveRecord[]; variant: GameVariant }) {
+function MoveHistory({ moves, variant, classifications }: { moves: MoveRecord[]; variant: GameVariant; classifications?: ClassifiedMove[] }) {
   if (moves.length === 0) {
     return <div className="text-silver-dim text-sm py-8 text-center">No moves yet</div>;
   }
-  const pairs: [MoveRecord, MoveRecord | null][] = [];
+  const pairs: [MoveRecord, MoveRecord | null, ClassifiedMove | null, ClassifiedMove | null][] = [];
   for (let i = 0; i < moves.length; i += 2) {
-    pairs.push([moves[i], moves[i + 1] ?? null]);
+    pairs.push([
+      moves[i],
+      moves[i + 1] ?? null,
+      classifications?.[i] ?? null,
+      classifications?.[i + 1] ?? null,
+    ]);
   }
   return (
     <div className="space-y-1 text-sm font-mono">
-      {pairs.map(([m1, m2], idx) => (
+      {pairs.map(([m1, m2, c1, c2], idx) => (
         <div key={idx} className="grid grid-cols-[28px_1fr_1fr] gap-2 py-1.5 px-2 rounded hover:bg-silver-mid/5">
           <span className="text-silver-dim">{idx + 1}.</span>
-          <span className="text-silver-primary">{m1.san}</span>
-          {m2 ? <span className="text-silver-primary">{m2.san}</span> : <span />}
+          <div className="flex items-baseline gap-1.5">
+            <span className="text-silver-primary">{m1.san}</span>
+            {c1 && (
+              <span
+                className="text-[10px] px-1 py-0.5 rounded font-bold"
+                style={{ color: getClassificationColor(c1.classification), background: `${getClassificationColor(c1.classification)}15` }}
+                title={c1.description}
+              >
+                {c1.label}
+              </span>
+            )}
+          </div>
+          {m2 ? (
+            <div className="flex items-baseline gap-1.5">
+              <span className="text-silver-primary">{m2.san}</span>
+              {c2 && (
+                <span
+                  className="text-[10px] px-1 py-0.5 rounded font-bold"
+                  style={{ color: getClassificationColor(c2.classification), background: `${getClassificationColor(c2.classification)}15` }}
+                  title={c2.description}
+                >
+                  {c2.label}
+                </span>
+              )}
+            </div>
+          ) : (
+            <span />
+          )}
         </div>
       ))}
     </div>

@@ -124,8 +124,8 @@ export function XiangqiBoard({ analysis, playerSide, onMove, lastMove, moves, is
   }
 
   return (
-    <div className="relative" style={{ width: W, height: H }}>
-      <svg viewBox={`0 0 ${W} ${H}`} className="rounded-md shadow-2xl shadow-black" style={{ background: '#0E0E10' }}>
+    <div className="relative w-full max-w-[600px] mx-auto" style={{ aspectRatio: `${W} / ${H}` }}>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="xMidYMid meet" className="w-full h-full rounded-md shadow-2xl shadow-black block" style={{ background: '#0E0E10' }}>
         {/* 背景米色 */}
         <rect width={W} height={H} fill="#2A2318" />
 

@@ -1,19 +1,25 @@
 // GTP 协议解析 — KataGo 围棋专用
-// 参考: https://github.com/lightvector/KataGo/blob/master/docs/GTP_Extensions.md
+// KataGo kata-analyze 输出格式: `info move X visits N ... pv X info move Y visits N ...`
+// 每个 info 行可能包含 1-N 个候选着法的完整数据(visit/winrate/pv 等),
+// 不再有 "turn 1 visits 1" 的 root 段。
 
 import { Analysis, PvLine } from '../../types';
 
 export interface GtpAnalysisRaw {
-  // kata-genmove_analyze / lz-genmove_analyze 输出的字段
   turnNumber?: number;
   rootInfo?: {
     winRate: number;
     scoreLead: number;
     scoreStdev?: number;
     utility?: number;
+    visits?: number;
   };
   moveInfos?: Map<string, GtpMoveInfo>; // by move string
   isDone?: boolean;
+  /** 整个棋盘 ownership (Black territory probability per vertex, 1=Black, -1=White, 0=neutral) */
+  ownership?: number[][];
+  /** 累积中的 raw ownership tokens (1D) */
+  ownershipRaw?: number[];
 }
 
 export interface GtpMoveInfo {
@@ -25,79 +31,42 @@ export interface GtpMoveInfo {
   utility?: number;
   lcb?: number;
   pv?: string[];
-  policy?: number; // 0~1
+  policy?: number;
   order?: number;
+  prior?: number;
 }
+
+const STOP_TOKENS = new Set([
+  'move', 'visits', 'winrate', 'scoreLead', 'policy', 'order',
+  'ownership', 'ownershipStones', 'pvOwnership', 'pvOwnershipStones',
+  'info', 'pv', 'lcb', 'utility', 'scoreStdev', 'scoreMean',
+  'scoreSelfplay', 'prior', 'edgeVisits', 'weight', 'utilityLcb',
+  'isSymmetryOf', 'turn',
+]);
 
 /**
  * 解析 GTP kata-analyze 行。
- * 格式: kata-...: <turn> visits winrate X scoreLead Y [scoreStdev Z utility U] move D4 visits ... winrate X ... pv ... policy ... ownership ...
  *
- * Example:
- *   kata-genmove_analyze B 0.1
- *   ...
- *   info turn 1 visits 1 utility 0.335384 winrate 0.461741 scoreLead -2.41258 ... pv B Q16 ... policy 0.0123
- *   info move Q4 visits 1 prior 0.012345 ... winrate 0.487932 scoreLead -2.34 ... pv Q4 D16 ...
- *   ...
+ * KataGo v1.18.1 kata-analyze 实际输出格式:
+ *   info move R16 visits 0 prior 0.073 winrate 0.351 scoreLead -1.02 lcb -4.64 order 0 pv R16
+ *   info move R4 visits 0 prior 0.045 winrate 0.348 ...
+ *   (多个 move 段在同一行内)
+ *
+ * 注意: 没有 "turn 1 visits 1" 格式的 root 段。
+ * rootInfo 从 top-visits move 的数据推导。
  */
 export function parseGtpInfoLine(line: string): GtpAnalysisRaw | null {
   if (!line.startsWith('info ')) return null;
-  // 移除前缀
   const tokens = line.slice(5).split(/\s+/);
   const out: GtpAnalysisRaw = { moveInfos: new Map() };
-  let currentMove: string | null = null;
-
-  // root info 出现在 line 开头,后面可能跟 'move X visits...' 子段
   let i = 0;
-  // root 部分
-  const root: { winRate?: number; scoreLead?: number; scoreStdev?: number; utility?: number; visits?: number; turn?: number } = {};
+
+  // Process token stream: each 'move <name>' starts a new candidate.
   while (i < tokens.length) {
     const tok = tokens[i];
-    if (tok === 'move') {
-      // 进入 move 子段
-      break;
-    }
-    switch (tok) {
-      case 'turn':
-        root.turn = parseInt(tokens[++i], 10);
-        out.turnNumber = root.turn;
-        break;
-      case 'visits':
-        root.visits = parseInt(tokens[++i], 10);
-        break;
-      case 'winrate':
-        root.winRate = parseFloat(tokens[++i]);
-        break;
-      case 'scoreLead':
-        root.scoreLead = parseFloat(tokens[++i]);
-        break;
-      case 'scoreStdev':
-        root.scoreStdev = parseFloat(tokens[++i]);
-        break;
-      case 'utility':
-        root.utility = parseFloat(tokens[++i]);
-        break;
-      default:
-        break;
-    }
-    i++;
-  }
 
-  if (root.winRate !== undefined || root.scoreLead !== undefined) {
-    out.rootInfo = {
-      winRate: root.winRate ?? 0.5,
-      scoreLead: root.scoreLead ?? 0,
-      scoreStdev: root.scoreStdev,
-      utility: root.utility,
-    };
-  }
-
-  // move 子段
-  while (i < tokens.length) {
-    const tok = tokens[i];
     if (tok === 'move') {
       const moveName = tokens[++i];
-      currentMove = moveName;
       const info: GtpMoveInfo = {
         move: moveName,
         visits: 0,
@@ -109,83 +78,125 @@ export function parseGtpInfoLine(line: string): GtpAnalysisRaw | null {
       i++;
       continue;
     }
-    if (currentMove && out.moveInfos!.has(currentMove)) {
-      const info = out.moveInfos!.get(currentMove)!;
-      switch (tok) {
-        case 'visits':
-          info.visits = parseInt(tokens[++i], 10);
-          break;
-        case 'winrate':
-          info.winRate = parseFloat(tokens[++i]);
-          break;
-        case 'scoreLead':
-          info.scoreLead = parseFloat(tokens[++i]);
-          break;
-        case 'scoreStdev':
-          info.scoreStdev = parseFloat(tokens[++i]);
-          break;
-        case 'utility':
-          info.utility = parseFloat(tokens[++i]);
-          break;
-        case 'lcb':
-          info.lcb = parseFloat(tokens[++i]);
-          break;
-        case 'pv':
-          // pv 后面一直到下一个关键字
-          const pvTokens: string[] = [];
-          i++;
-          while (i < tokens.length && !['move', 'visits', 'winrate', 'scoreLead', 'policy', 'order', 'ownership'].includes(tokens[i])) {
-            pvTokens.push(tokens[i]);
-            i++;
-          }
-          info.pv = pvTokens;
-          continue;
-        case 'policy':
-          info.policy = parseFloat(tokens[++i]);
-          break;
-        case 'prior':
-          // KataGo uses 'prior' (policy prior probability) instead of 'policy'
-          (info as any).prior = parseFloat(tokens[++i]);
-          break;
-        case 'order':
-          info.order = parseInt(tokens[++i], 10);
-          break;
-        default:
-          i++;
-      }
-      i++;
-    } else {
-      i++;
+
+    // At this point we're processing properties for the current move.
+    // Find the current move (last one added to moveInfos).
+    let currentMove: string | null = null;
+    if (out.moveInfos!.size > 0) {
+      // Last added key
+      currentMove = Array.from(out.moveInfos!.keys()).at(-1) ?? null;
     }
+
+    if (!currentMove) {
+      // No move context yet — skip this token (shouldn't happen with valid KataGo output)
+      i++;
+      continue;
+    }
+
+    const info = out.moveInfos!.get(currentMove)!;
+    switch (tok) {
+      case 'visits':
+        info.visits = parseInt(tokens[++i], 10);
+        break;
+      case 'winrate':
+        info.winRate = parseFloat(tokens[++i]);
+        break;
+      case 'scoreLead':
+        info.scoreLead = parseFloat(tokens[++i]);
+        break;
+      case 'scoreStdev':
+        info.scoreStdev = parseFloat(tokens[++i]);
+        break;
+      case 'utility':
+        info.utility = parseFloat(tokens[++i]);
+        break;
+      case 'lcb':
+        info.lcb = parseFloat(tokens[++i]);
+        break;
+      case 'prior':
+        // KataGo uses 'prior' (policy prior probability) instead of 'policy'
+        info.prior = parseFloat(tokens[++i]);
+        break;
+      case 'policy':
+        info.policy = parseFloat(tokens[++i]);
+        break;
+      case 'order':
+        info.order = parseInt(tokens[++i], 10);
+        break;
+      case 'pv': {
+        const pvTokens: string[] = [];
+        i++;
+        while (
+          i < tokens.length &&
+          !STOP_TOKENS.has(tokens[i])
+        ) {
+          pvTokens.push(tokens[i]);
+          i++;
+        }
+        info.pv = pvTokens;
+        continue; // don't i++
+      }
+      case 'ownership':
+      case 'ownershipStones':
+      case 'pvOwnership':
+      case 'pvOwnershipStones': {
+        // Collect ownership tokens (361 values = 19x19 board)
+        if (!out.ownership) out.ownership = [];
+        const ownTokens: number[] = [];
+        i++;
+        while (i < tokens.length && !STOP_TOKENS.has(tokens[i])) {
+          const v = parseFloat(tokens[i]);
+          if (!isNaN(v)) ownTokens.push(v);
+          i++;
+        }
+        // Convert 1D → 2D (19x19) if we have 361 tokens
+        if (out.ownership.length === 0 && ownTokens.length >= 361) {
+          for (let r = 0; r < 19; r++) {
+            const row: number[] = [];
+            for (let c = 0; c < 19; c++) {
+              row.push(ownTokens[r * 19 + c] ?? 0);
+            }
+            out.ownership.push(row);
+          }
+        }
+        continue; // don't i++
+      }
+      case 'turn':
+        out.turnNumber = parseInt(tokens[++i], 10);
+        break;
+      default:
+        // Unknown token — skip its value (the token itself; the value was consumed by switch's i++)
+        // Actually unknown tokens appear WITHOUT a following value in KataGo output
+        // (edgeVisits, weight, isSymmetryOf, etc.) — just skip the token
+        break;
+    }
+    i++;
+  }
+
+  // Derive rootInfo from the best-visited move (KataGokata-analyze has no explicit root line)
+  if (!out.rootInfo && out.moveInfos && out.moveInfos.size > 0) {
+    let bestMove: GtpMoveInfo | null = null;
+    let bestVisits = -1;
+    let totalVisits = 0;
+
+    for (const info of out.moveInfos.values()) {
+      totalVisits += info.visits;
+      if (info.visits > bestVisits) {
+        bestVisits = info.visits;
+        bestMove = info;
+      }
+    }
+
+    out.rootInfo = {
+      winRate: bestMove?.winRate ?? 0.5,
+      scoreLead: bestMove?.scoreLead ?? 0,
+      scoreStdev: bestMove?.scoreStdev,
+      utility: bestMove?.utility,
+      visits: totalVisits,
+    };
   }
 
   return out;
-}
-
-/**
- * 解析 kata-set_rules 给的 ownership 字符串 (按 board 顺序,从左上到右下)
- * KataGo 输出: ownership <space-separated 361 values for 19x19>
- */
-export function parseOwnership(blob: string, boardSize: number): number[][] {
-  const tokens = blob.trim().split(/\s+/);
-  const grid: number[][] = [];
-  for (let r = 0; r < boardSize; r++) {
-    const row: number[] = [];
-    for (let c = 0; c < boardSize; c++) {
-      const idx = r * boardSize + c;
-      const v = parseFloat(tokens[idx] ?? '0');
-      row.push(isNaN(v) ? 0 : v);
-    }
-    grid.push(row);
-  }
-  return grid;
-}
-
-/**
- * 解析 kata-search_analyze 的 policy (整个 board 的概率)
- */
-export function parsePolicy(blob: string, boardSize: number): number[][] {
-  return parseOwnership(blob, boardSize); // 同格式
 }
 
 /**
@@ -195,14 +206,10 @@ export function gtpMoveToCoord(move: string, boardSize = 19): { row: number; col
   if (move === 'pass' || move === 'PASS' || move === 'resign') {
     return { row: -1, col: -1, pass: true };
   }
-  // GTP format: <column letter>(skipping I)<row number>
-  // e.g. Q16 → col Q = 16 (A=0, B=1, ..., H=7, J=8, ..., Q=16), row 16 → 15 (0-indexed)
   const colChar = move[0]?.toUpperCase();
-  if (!colChar) return null;
-  let col: number;
-  if (colChar === 'I') return null; // I is skipped in GTP
-  col = colChar.charCodeAt(0) - 'A'.charCodeAt(0);
-  if (colChar > 'I') col--; // adjust for skipping I
+  if (!colChar || colChar === 'I') return null;
+  let col = colChar.charCodeAt(0) - 'A'.charCodeAt(0);
+  if (colChar > 'I') col--;
   const row = parseInt(move.slice(1), 10) - 1;
   if (isNaN(row) || row < 0 || row >= boardSize) return null;
   if (col < 0 || col >= boardSize) return null;
@@ -220,6 +227,8 @@ export function coordToGtpMove(row: number, col: number, boardSize = 19): string
 
 /**
  * 把 GtpAnalysisRaw 累积成 Analysis
+ * ownership 不从 kata-analyze 获取 — KataGo kata-analyze 不输出 ownership。
+ * 通过 engineManager.requestOwnership() 单独拉取。
  */
 export function buildGtpAnalysis(opts: {
   raw: GtpAnalysisRaw;
@@ -229,57 +238,62 @@ export function buildGtpAnalysis(opts: {
   ownership?: number[][];
 }): Analysis {
   const lines: PvLine[] = [];
-  // 多线: 取 visit 数前 N
+
+  // Sort by visits (descending), take top 12
   const sorted = Array.from(opts.raw.moveInfos?.values() ?? [])
     .sort((a, b) => b.visits - a.visits)
-    .slice(0, 5);
+    .slice(0, 12);
+
   for (let i = 0; i < sorted.length; i++) {
     const info = sorted[i];
-    // winRate 从 KataGo 是 side-to-move 视角; 玩家执子视角需转换
+    // winRate: KataGo is side-to-move perspective; flip for white player
     let winRate = info.winRate;
     if (opts.playerColor === 'W') winRate = 1 - winRate;
+    const scoreLead = info.scoreLead;
+    const scoreCp = opts.playerColor === 'W' ? -Math.round(scoreLead * 100) : Math.round(scoreLead * 100);
+
     lines.push({
       id: i + 1,
       move: info.move,
       pv: info.pv ?? [info.move],
       winRate,
+      scoreCp,
+      visits: info.visits,
+      order: info.order,
+      prior: info.prior,
     });
   }
 
-  // policy 热力图 (按玩家概率,可用于可视化)
+  // Policy heatmap (policy prior probability per vertex)
   const policy: number[][] = [];
   for (let r = 0; r < opts.boardSize; r++) {
-    const row: number[] = [];
-    for (let c = 0; c < opts.boardSize; c++) {
-      row.push(0);
-    }
-    policy.push(row);
+    policy.push(new Array(opts.boardSize).fill(0));
   }
   if (opts.raw.moveInfos) {
     for (const info of opts.raw.moveInfos.values()) {
       const coord = gtpMoveToCoord(info.move, opts.boardSize);
-      // 优先用 'prior' (KataGo 格式), fallback 到 'policy'
-      const priorProb = (info as any).prior ?? info.policy;
+      const priorProb = info.prior ?? info.policy;
       if (coord && !coord.pass && priorProb !== undefined) {
         policy[coord.row][coord.col] = priorProb;
       }
     }
   }
 
-  // 胜率: rootInfo.winRate 是 side-to-move 视角, 玩家执白则翻转
+  // Win rate: rootInfo.winRate is side-to-move perspective; flip for white
   const rootWr = opts.raw.rootInfo?.winRate ?? 0.5;
   const winRate = opts.playerColor === 'W' ? 1 - rootWr : rootWr;
   const scoreLead = opts.raw.rootInfo?.scoreLead ?? 0;
 
   return {
     variant: 'go',
-    depth: opts.raw.rootInfo ? Math.round((opts.raw.rootInfo.utility ?? 0) * 100) : 0,
+    depth: opts.raw.rootInfo?.visits ?? 0,
     winRate,
-    scoreCp: Math.round(scoreLead * 100), // KataGo scoreLead → centipoints
+    scoreCp: Math.round(scoreLead * 100),
     multiPv: lines,
     engine: opts.engine,
     ts: Date.now(),
     policy,
-    ownership: opts.ownership,
+    // ownership 从外部传入 (通过 kata-ownership 单独请求)
+    ownership: opts.raw.ownership ?? opts.ownership,
   };
 }

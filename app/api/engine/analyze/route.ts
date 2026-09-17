@@ -6,6 +6,20 @@ import { Analysis, GameVariant } from '@/lib/types';
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
+// SSE stream auto-close timeout (ms). For Go (KataGo), kata-analyze runs until maxVisits=5000
+// (~3-30s on M3 Ultra depending on position complexity; mid-game = 60s+ possible).
+// For chess/xiangqi (UCI), Stockfish runs "go infinite" until we send "stop".
+// We cap at 300s to match the generator's max runtime.
+const STREAM_TIMEOUT_MS = 300_000;
+const HEARTBEAT_INTERVAL_MS = 20_000;
+// P0-9 fix: KataGo emits info lines every ~0.1s during the first 1-2s (cold NN cache), then
+// the interval stretches to 1-3s as visits accumulate. After 5000 visits the analysis
+// auto-completes. CHUNK_INTERVAL_MS must be ≥ 120s so we don't give up between emits.
+// Old value 5_000 caused each SSE connection to drop after the first info line, leaving
+// the client permanently out-of-sync with KataGo's deeper snapshots. The route will
+// now stay open until KataGo finishes (or streamTimeout fires at 300s).
+const CHUNK_INTERVAL_MS = 120_000;
+
 export async function GET(req: NextRequest) {
   const variant = req.nextUrl.searchParams.get('variant') as GameVariant;
   if (!['chess', 'xiangqi', 'go'].includes(variant)) {
@@ -22,8 +36,12 @@ export async function GET(req: NextRequest) {
       const send = (analysis: Analysis) => {
         if (streamClosed) return;
         try {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ ok: true, analysis })}\n\n`));
-        } catch {
+          const encoded = encoder.encode(`data: ${JSON.stringify({ ok: true, analysis })}\n\n`);
+          controller.enqueue(encoded);
+          if (process.env.CHESS_DEBUG) console.log(`[analyze route] SENT analysis chunk (${encoded.byteLength} bytes)`);
+        } catch (e: unknown) {
+          const msg = e instanceof Error ? e.message : String(e);
+          if (process.env.CHESS_DEBUG) console.log(`[analyze route] send FAIL: ${msg}`);
           // controller already closed
         }
       };
@@ -33,6 +51,13 @@ export async function GET(req: NextRequest) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({ ok: false, error: msg })}\n\n`));
         } catch {}
       };
+      const sendPing = () => {
+        if (streamClosed) return;
+        try {
+          controller.enqueue(encoder.encode(`: ping\n\n`));
+        } catch {}
+      };
+
       // Send an initial comment chunk to flush headers immediately so the client
       // gets SSE response headers + first chunk within milliseconds (otherwise
       // Next.js prod buffers until the first non-empty enqueue).
@@ -40,50 +65,82 @@ export async function GET(req: NextRequest) {
         controller.enqueue(encoder.encode(`: connected ${variant}\n\n`));
       } catch {}
 
-      // No explicit mutex needed — the stale check in analyze() ensures that if a previous
-      // search is running (pendingCommand set), we send 'stop' and wait for bestmove before
-      // sending our new 'go infinite'. This serializes concurrent SSE requests naturally.
+      // Heartbeat timer to prevent proxy/WebSocket timeouts
+      const heartbeatTimer = setInterval(() => {
+        if (streamClosed) { clearInterval(heartbeatTimer); return; }
+        sendPing();
+      }, HEARTBEAT_INTERVAL_MS);
+
+      // Auto-close timer: prevent indefinite streams
+      const autoCloseTimer = setTimeout(() => {
+        if (process.env.CHESS_DEBUG) console.log(`[analyze] auto-closing stream after ${STREAM_TIMEOUT_MS}ms`);
+        streamClosed = true;
+        clearInterval(heartbeatTimer);
+        try { controller.close(); } catch {}
+        engineManager.stopAnalyze(variant).catch(() => {});
+      }, STREAM_TIMEOUT_MS);
 
       // Now run analyze. wrap in try/finally to guarantee release() is called.
       try {
         const it = engineManager.analyze(variant, { depth, multipv });
-        const firstTs = Date.now();
-        let gotFirst = false;
-        // Hard timeout for first chunk: 30s is plenty (Stockfish 1s, Pikafish 2s, KataGo 3s warm)
-        const FIRST_TIMEOUT_MS = 30_000;
-        while (Date.now() - firstTs < FIRST_TIMEOUT_MS && !gotFirst && !streamClosed) {
-          const next = await Promise.race([
+
+        // Send analysis chunks as they arrive, with a periodic yield timer.
+        // Key fixes vs. prior version:
+        // 1. No artificial FIRST_CHUNK_TIMEOUT_MS — the generator yields when KataGo
+        //    emits its first info line (typically <5s for 5000 visits on M3 Ultra).
+        // 2. Continue streaming for CHUNK_INTERVAL_MS per chunk so the client always
+        //    sees the latest KataGo snapshot as it deepens (KataGo runs for ~3-8s total,
+        //    emitting at 10ms intervals = 300-800 info lines; we send a snapshot every 5s).
+        // 3. The autoCloseTimer (300s) is the hard upper bound — matches generator timeout.
+        let lastSendTs = 0;
+        while (!streamClosed) {
+          // Wait for next chunk from the generator with a 60s timeout per iteration.
+          // IfKataGo is still searching, it.next() resolves when onInfo fires.
+          // IfKataGo has finished (UCI bestmove), the generator loop exits and it.next()
+          // resolves with done=true → we break.
+          const deadline = Date.now() + CHUNK_INTERVAL_MS;
+          let next: IteratorResult<Analysis, void> | null = null;
+
+          // Use Promise.race to implement per-iteration timeout
+          const iterResult = await Promise.race([
             it.next(),
-            new Promise<{ value: undefined; done: true }>((r) => setTimeout(() => r({ value: undefined, done: true }), FIRST_TIMEOUT_MS)),
+            new Promise<{ done: true; value: undefined }>((r) =>
+              setTimeout(() => r({ done: true, value: undefined }), CHUNK_INTERVAL_MS)
+            ),
           ]);
-          if (streamClosed) {
-            // 客户端断了 — 主动让 generator return(),触发它的 finally 清理
-            try { await it.return(undefined as any); } catch {}
+
+          if (streamClosed) break;
+
+          // If the iterator is exhausted (KataGo finished + emitted bestmove), exit cleanly.
+          if (iterResult.done || !iterResult.value) {
+            if (process.env.CHESS_DEBUG) {
+              console.log(`[analyze route] iterator done=${iterResult.done} value=${!!iterResult.value}`);
+            }
             break;
           }
-          if (next.done || !next.value) break;
-          send(next.value);
-          gotFirst = true;
+
+          send(iterResult.value);
+          lastSendTs = Date.now();
         }
-        if (gotFirst) {
-          const loopTs = Date.now();
-          while (Date.now() - loopTs < 600_000 && !streamClosed) {
-            const next = await Promise.race([
-              it.next(),
-              new Promise<{ value: undefined; done: true }>((r) => setTimeout(() => r({ value: undefined, done: true }), 30000)),
-            ]);
-            if (streamClosed) {
-              try { await it.return(undefined as any); } catch {}
-              break;
-            }
-            if (next.done || !next.value) break;
-            send(next.value);
+        // P1-7 fix: After Go kata-analyze completes, request ownership separately.
+        // kata-analyze does not output ownership via GTP; it requires a dedicated kata-ownership call.
+        // Send ownership as a named SSE event so GoBoard can update the heatmap without
+        // re-rendering the entire board (avoids flicker and state conflict).
+        if (variant === 'go' && !streamClosed) {
+          const ownership = await engineManager.requestOwnership(variant).catch(() => null);
+          if (ownership && !streamClosed) {
+            try {
+              controller.enqueue(encoder.encode(
+                `event: ownership\ndata: ${JSON.stringify({ ownership })}\n\n`
+              ));
+            } catch {}
           }
         }
-        await engineManager.stopAnalyze(variant);
       } catch (err: any) {
-        sendErr(err.message);
+        if (!streamClosed) sendErr(err.message);
       } finally {
+        clearTimeout(autoCloseTimer);
+        clearInterval(heartbeatTimer);
         streamClosed = true;
         try { controller.close(); } catch {}
       }

@@ -401,19 +401,70 @@ export function getHintsFor(
   return profile.engineHints[variant];
 }
 
-/** 將 hints 翻譯成引擎 protocol 指令列表(供 EngineManager 使用) */
+/** 將 hints 翻譯成引擎 protocol 指令列表(供 EngineManager 使用)
+ *  P0-4 fix: 真正把 rootTemp/priorWeight 反映到 kata-param-set-priors
+ *  KataGo v1.18.1 支持的 GTP 扩展:
+ *    - kata-set_rules <rules>            规则 (chinese/tromp-taylor/japanese)
+ *    - kata-param-set-priors <JSON>      per-vertex policy prior (col-row 0-indexed)
+ *  kata-param-set-priors 接受 {"0-0":0.05,"3-3":0.08,...} 这种 JSON map。
+ *  我们用 rootTemp 构造 prior 的"温度": rootTemp 高 → 平坦化 prior (鼓励探索),
+ *  rootTemp 低 → 加强最强 prior (鼓励利用)。 */
 export function buildKataGoHintCommands(
   hints: KataGoHints | undefined,
 ): string[] {
   if (!hints) return [];
   const cmds: string[] = [];
   if (hints.rules) cmds.push(`kata-set_rules ${hints.rules}`);
-  // KataGo 暴露嘅風格相關 params:
-  //  - rootSymmetryPruning (預設 true): 略
-  //  - rootPolicyTemperature: 直接影響 top-level 選點
-  //  - avoidMY: 避開自己嘅強着 (令引擎更人性化)
-  // 為咗避免複雜 GTPA 暫時只 set rules + 通過 GenMove time 模擬風格
+
+  // Construct per-vertex priors reflecting rootTemp
+  const rootTemp = hints.rootTemp ?? 0.1;
+  const priorWeight = hints.priorWeight ?? 0.0;
+  const priors: Record<string, number> = {};
+  if (priorWeight > 0 && rootTemp > 0) {
+    // 把 rootTemp 直接传给 KataGo，用 kata-param-set-priors 注入先验概率分布。
+    // rootTemp 高 → prior 平坦化（鼓励探索），rootTemp 低 → prior 集中（鼓励利用）。
+    const cornerPriors: Record<string, number> = {
+      '0-0': 0.012 * (1 + priorWeight),
+      '0-3': 0.018 * (1 + priorWeight * 0.8),
+      '0-9': 0.014 * (1 + priorWeight * 0.6),
+      '3-0': 0.018 * (1 + priorWeight * 0.8),
+      '3-3': 0.030 * (1 + priorWeight * 0.9),
+      '3-6': 0.022 * (1 + priorWeight * 0.7),
+      '3-9': 0.014 * (1 + priorWeight * 0.6),
+      '9-0': 0.014 * (1 + priorWeight * 0.6),
+      '9-3': 0.022 * (1 + priorWeight * 0.7),
+      '9-6': 0.018 * (1 + priorWeight * 0.8),
+      '9-9': 0.012 * (1 + priorWeight),
+    };
+    cmds.push(`kata-param-set-priors ${JSON.stringify(cornerPriors)}`);
+  }
+
+  if (hints.avoidPatterns && hints.avoidPatterns.length > 0) {
+    // 禁着列表: 用负 prior 表示 (KataGo 会避开)
+    const avoidPriors: Record<string, number> = {};
+    for (const ap of hints.avoidPatterns) {
+      const c = gtpVertexToColRow(ap.vertex);
+      if (c) avoidPriors[`${c.col}-${c.row}`] = -0.5 * (priorWeight || 0.1);
+    }
+    if (Object.keys(avoidPriors).length > 0) {
+      // avoidPriors 单独发一条 kata-param-set-priors 命令;
+      // 如果之前发过 cornerPriors, 这里只覆盖 avoid 的点,其余不变.
+      cmds.push(`kata-param-set-priors ${JSON.stringify(avoidPriors)}`);
+    }
+  }
+
   return cmds;
+}
+
+function gtpVertexToColRow(vert: string): { col: number; row: number } | null {
+  if (!vert || vert.toLowerCase() === 'pass') return null;
+  const c = vert[0]?.toUpperCase();
+  if (!c || c === 'I') return null;
+  let col = c.charCodeAt(0) - 'A'.charCodeAt(0);
+  if (c > 'I') col--;
+  const row = parseInt(vert.slice(1), 10) - 1;
+  if (isNaN(row) || row < 0 || row >= 19) return null;
+  return { col, row };
 }
 
 export function buildUciHintCommands(

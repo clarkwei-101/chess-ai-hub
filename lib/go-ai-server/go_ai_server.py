@@ -434,7 +434,7 @@ class KataGoManager:
         self.proc: Optional[subprocess.Popen] = None
         self.lock = threading.Lock()
         self._startup_done = False
-        self.pending: dict[int, tuple[asyncio.Future, str]] = {}
+        self.pending: dict[int, tuple["Queue", str]] = {}
         self.cmd_id = 0
         self.reader_task: Optional[threading.Thread] = None
         self._running = False
@@ -496,9 +496,13 @@ class KataGoManager:
         payload = m.group(2).strip()
         if cmd_id_str:
             cid = int(cmd_id_str)
-            fut, _ = self.pending.pop(cid, (None, ""))
-            if fut and not fut.done():
-                fut.set_result(payload)
+            entry = self.pending.pop(cid, (None, ""))
+            fut, _ = entry
+            if fut is not None:
+                try:
+                    fut.put((True, payload))
+                except Exception:
+                    pass
 
     def _send(self, cmd: str) -> str:
         """Send GTP command synchronously and wait for response."""
@@ -507,14 +511,19 @@ class KataGoManager:
                 raise RuntimeError("KataGo not running")
             cid = self.cmd_id
             self.cmd_id += 1
-            fut: asyncio.Future = asyncio.Future()
-            self.pending[cid] = (fut, cmd)
+            # Use threading.Event + queue instead of asyncio.Future so this works
+            # in a synchronous context (HTTPServer thread, not asyncio loop).
+            # Python 3.12+ rejects asyncio.Future attached to a different loop.
+            from queue import Queue
+            response_q: "Queue[tuple[bool, str]]" = Queue()
+            self.pending[cid] = (response_q, cmd)
         full_cmd = f"{cid} {cmd}" if cid > 0 else cmd
         self.proc.stdin.write((full_cmd + "\n").encode())
         self.proc.stdin.flush()
         try:
-            return asyncio.run(asyncio.wait_for(fut, timeout=30.0))
-        except asyncio.TimeoutError:
+            ok, payload = response_q.get(timeout=30.0)
+            return payload if ok else "?"
+        except Exception:
             with self.lock:
                 self.pending.pop(cid, None)
             return "?"

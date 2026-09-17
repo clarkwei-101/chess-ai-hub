@@ -56,6 +56,15 @@ export async function POST(req: NextRequest) {
     const maxVisits = (body.maxVisits as number | undefined) ?? undefined;
     const styleId = (body.styleId as string | undefined) ?? 'default';
     const goMoves = (body.goMoves as string[] | undefined) ?? [];
+    // P2-4 fix: validate goMoves format — only accept valid GTP strings + pass/resign.
+    // Reject malformed entries silently so we don't send garbage to the engine and
+    // crash the Go AI server.
+    const validatedGoMoves = goMoves.filter((m) => {
+      if (typeof m !== 'string') return false;
+      if (m === 'pass' || m === 'resign') return true;
+      // GTP: column letter (A-T except I), row 1-19, optional at sign @ for handicap
+      return /^[A-HJ-T](1[0-9]|@[1-9]|[1-9])$/i.test(m);
+    });
 
     if (!['chess', 'xiangqi', 'go'].includes(variant)) {
       return NextResponse.json({ ok: false, error: 'Invalid variant' }, { status: 400 });
@@ -75,7 +84,7 @@ export async function POST(req: NextRequest) {
         const color = body.color as 'B' | 'W' ?? 'B';
         const style = styleId ?? 'default';
         const serverResult = await callGoAIServer('/move', {
-          moves: goMoves,
+          moves: validatedGoMoves,
           style,
           color,
           time_ms: timeMs ?? 60000, // 60s for strong play

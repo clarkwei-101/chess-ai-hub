@@ -52,6 +52,9 @@ export interface PvLine {
   pv: string[]; // principal variation (后续着法)
   winRate: number;
   scoreCp?: number;
+  visits?: number; // KataGo: this move's visit count (UI 显示 "820 visits")
+  order?: number; // KataGo's ranking (0 = best)
+  prior?: number; // policy prior probability (0~1, hot-heatmap source)
   scoreMate?: number;
 }
 
@@ -89,6 +92,8 @@ export interface MoveRecord {
   winRate?: number;
   // 该步之后的 cp / score
   scoreCp?: number;
+  // 围棋专用: KataGo scoreLead (目数差, from Analysis.scoreCp / 100)
+  scoreLead?: number;
   // 该步的分析来源
   pv?: string[];
   comment?: string;

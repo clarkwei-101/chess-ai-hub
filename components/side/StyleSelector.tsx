@@ -65,13 +65,23 @@ export function StyleSelector({ variant, value, onChange }: StyleSelectorProps) 
     <div className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-2 px-3 py-2 rounded-lg border border-silver-mid/30 bg-black-elevated hover:bg-silver-mid/10 transition-colors text-sm"
+        className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors text-sm ${
+          selected && selected.id !== 'default'
+            ? 'border-cyan-400/50 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/15'
+            : 'border-silver-mid/30 bg-black-elevated hover:bg-silver-mid/10'
+        }`}
+        aria-label="棋手风格选择"
       >
         <span className="text-silver-dim text-xs">Style · 棋手</span>
         {selected ? (
           <span className="text-silver-primary font-medium">{selected.nameCn}</span>
         ) : (
           <span className="text-silver-dim">Loading...</span>
+        )}
+        {selected && selected.country && selected.id !== 'default' && (
+          <span className="text-[10px] px-1 py-0.5 rounded font-mono border border-cyan-400/40 text-cyan-300">
+            {COUNTRY_FLAG[selected.country]}
+          </span>
         )}
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={`text-silver-mid transition-transform ${open ? 'rotate-180' : ''}`}>
           <path d="M6 9l6 6 6-6" />
