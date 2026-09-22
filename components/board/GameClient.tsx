@@ -544,7 +544,7 @@ export function GameClient({ variant, sides, defaultSide, engine }: GameClientPr
   return (
     <main className="min-h-screen bg-black-deep">
       {/* Top Bar */}
-      <header className="border-b border-silver-border bg-black-rich/80 backdrop-blur-xl">
+      <header className="relative z-40 border-b border-silver-border bg-black-rich/80 backdrop-blur-xl">
         <div className="max-w-[1600px] mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-4">
             <a href="/" className="text-silver-mid hover:text-silver-primary transition-colors text-sm">

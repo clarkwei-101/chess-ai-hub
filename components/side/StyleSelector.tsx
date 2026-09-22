@@ -62,7 +62,7 @@ export function StyleSelector({ variant, value, onChange }: StyleSelectorProps) 
   }
 
   return (
-    <div className="relative">
+    <div className="relative z-50">
       <button
         onClick={() => setOpen((o) => !o)}
         className={`flex items-center gap-2 px-3 py-2 rounded-lg border transition-colors text-sm ${
